@@ -76,13 +76,16 @@ public class ReplicationManager {
         request.addHeader(Utils.TIMESTAMP_ONE_NIO + timestamp);
 
         List<Response> collectedResponses = new CopyOnWriteArrayList<>();
+        List<CompletableFuture<Response>> futures = new CopyOnWriteArrayList<>();
         AtomicInteger countReq = new AtomicInteger(0);
         int shardIndex = algorithm.chooseShard(id);
 
         for (int i = 0; i < from; ++i) {
             Shard shard = algorithm.getShardByIndex(shardIndex);
 
-            handleFinder(id, request, timestamp, shard).thenComposeAsync(
+            CompletableFuture<Response> future = handleFinder(id, request, timestamp, shard);
+            futures.add(future);
+            future.thenComposeAsync(
                     response -> {
                         addSuccessResponse(collectedResponses, response);
                         countReq.incrementAndGet();
@@ -99,14 +102,27 @@ public class ReplicationManager {
                                         session,
                                         new Response(Response.GATEWAY_TIMEOUT, Utils.stringToByte(NOT_ENOUGH_REPLICAS))
                                 );
+                                if (request.getMethod() == Request.METHOD_GET) {
+                                    cancelAnotherRequests(futures);
+                                }
                             }
                         } else if (currentSize >= ackNumber && canISendResponse(from, countReq, currentCount)) {
                             Utils.sendResponse(session, generateResult(collectedResponses, request.getMethod()));
+                            if (request.getMethod() == Request.METHOD_GET) {
+                                cancelAnotherRequests(futures);
+                            }
                         }
                     }
             );
-
             shardIndex = (shardIndex + 1) % algorithm.getShards().size();
+        }
+    }
+
+    private void cancelAnotherRequests(List<CompletableFuture<Response>> futures) {
+        for (CompletableFuture<Response> future : futures) {
+            if (!future.isDone()) {
+                future.cancel(true);
+            }
         }
     }
 
