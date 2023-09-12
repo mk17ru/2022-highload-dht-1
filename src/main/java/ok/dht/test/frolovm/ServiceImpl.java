@@ -1,75 +1,77 @@
 package ok.dht.test.frolovm;
 
-import jdk.incubator.foreign.MemorySegment;
 import ok.dht.Service;
 import ok.dht.ServiceConfig;
 import ok.dht.test.ServiceFactory;
-import ok.dht.test.drozdov.dao.Config;
-import ok.dht.test.drozdov.dao.Entry;
-import ok.dht.test.drozdov.dao.MemorySegmentDao;
-import one.nio.http.HttpServer;
+import ok.dht.test.frolovm.hasher.Hasher;
 import one.nio.http.HttpServerConfig;
 import one.nio.http.HttpSession;
 import one.nio.http.Param;
 import one.nio.http.Path;
 import one.nio.http.Request;
 import one.nio.http.Response;
-import one.nio.net.Session;
 import one.nio.server.AcceptorConfig;
-import one.nio.server.SelectorThread;
+import one.nio.util.Hash;
 import one.nio.util.Utf8;
+import org.iq80.leveldb.DB;
+import org.iq80.leveldb.Options;
+import org.iq80.leveldb.impl.Iq80DBFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import java.io.IOException;
-import java.util.concurrent.ArrayBlockingQueue;
+import java.net.http.HttpClient;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 public class ServiceImpl implements Service {
 
-    private static final int FLUSH_THRESHOLD_BYTES = 1_048_576;
     private static final String PATH_ENTITY = "/v0/entity";
+
+    private static final String PATH_RANGE = "/v0/entities";
     private static final String PARAM_ID_NAME = "id=";
-    private static final int CORE_POLL_SIZE = Runtime.getRuntime().availableProcessors() * 2;
+
+    private static final String PARAM_ACK_NAME = "ack";
+
+    private static final String PARAM_FROM_NAME = "from";
+
+    private static final String PARAM_START = "start";
+
+    private static final String PARAM_END = "end";
+
+    private static final int MAX_REQUEST_TRIES = 100;
+
+    private static final int CORE_POLL_SIZE = 2;
     private static final int KEEP_ALIVE_TIME = 0;
-    private static final int QUEUE_CAPACITY = 128;
-    private static final String BAD_ID = "Given id is bad.";
-    private static final String NO_SUCH_METHOD = "No such method.";
+    private static final int QUEUE_CAPACITY = 1024;
+
     private static final Logger LOGGER = LoggerFactory.getLogger(ServiceImpl.class);
     private final ServiceConfig config;
-    private ExecutorService requestService;
+    private final ShardingAlgorithm algorithm;
+    private HttpClient client;
+    private ReplicationManager replicationManager;
+    private HttpServerImpl server;
 
-    private MemorySegmentDao dao;
-    private HttpServer server;
+    private ExecutorService clientExecutor;
+
+    private DB dao;
 
     public ServiceImpl(ServiceConfig config) {
+        this(config, Hash::murmur3);
+    }
+
+    public ServiceImpl(ServiceConfig config, Hasher hasher) {
         this.config = config;
-    }
-
-    public ServiceImpl(ServiceConfig config, MemorySegmentDao dao) {
-        this.config = config;
-        this.dao = dao;
-    }
-
-    private static boolean checkId(String id) {
-        return id != null && !id.isBlank();
-    }
-
-    private static MemorySegment stringToSegment(String value) {
-        return MemorySegment.ofArray(Utf8.toBytes(value));
-    }
-
-    private static Response emptyResponse(String responseCode) {
-        return new Response(responseCode, Response.EMPTY);
+        this.algorithm = new RendezvousHashing(config.clusterUrls(), hasher);
     }
 
     private static HttpServerConfig createConfigFromPort(int port) {
         HttpServerConfig httpConfig = new HttpServerConfig();
         AcceptorConfig acceptor = createAcceptorConfig(port);
-        httpConfig.acceptors = new AcceptorConfig[] {acceptor};
+        httpConfig.acceptors = new AcceptorConfig[]{acceptor};
         return httpConfig;
     }
 
@@ -81,131 +83,109 @@ public class ServiceImpl implements Service {
     }
 
     private void createDao() throws IOException {
-        this.dao = new MemorySegmentDao(new Config(config.workingDir(), FLUSH_THRESHOLD_BYTES));
+        this.dao = Iq80DBFactory.factory.open(config.workingDir().toFile(), new Options());
     }
 
     @Override
     public CompletableFuture<?> start() throws IOException {
         if (dao == null) {
             createDao();
-            requestService = new ThreadPoolExecutor(
-                    CORE_POLL_SIZE,
-                    CORE_POLL_SIZE,
-                    KEEP_ALIVE_TIME,
-                    TimeUnit.SECONDS,
-                    new ArrayBlockingQueue<>(QUEUE_CAPACITY)
-            );
         }
-        server = new HttpServer(createConfigFromPort(config.selfPort())) {
-            @Override
-            public void handleDefault(Request request, HttpSession session) throws IOException {
-                session.sendResponse(emptyResponse(Response.BAD_REQUEST));
-            }
 
-            @Override
-            public void handleRequest(Request request, HttpSession session) {
-                Runnable handleTask = () -> {
-                    try {
-                        super.handleRequest(request, session);
-                    } catch (IOException e) {
-                        sessionSendError(session, e);
-                    }
-                };
-                try {
-                    requestService.execute(handleTask);
-                } catch (RejectedExecutionException exception) {
-                    LOGGER.error("If this task cannot be accepted for execution", exception);
-                }
-            }
-
-            private void sessionSendError(HttpSession session, IOException e) {
-                try {
-                    session.sendError(Response.BAD_REQUEST, e.getMessage());
-                    LOGGER.error("Can't handle request", e);
-                } catch (IOException exception) {
-                    LOGGER.error("Can't send error message to Bad Request", exception);
-                }
-            }
-
-            @Override
-            public synchronized void stop() {
-                closeSessions();
-                super.stop();
-            }
-
-            private void closeSessions() {
-                for (SelectorThread selectorThread : selectors) {
-                    selectorThread.selector.forEach(Session::close);
-                }
-            }
-        };
+        server = new HttpServerImpl(createConfigFromPort(config.selfPort()));
         server.addRequestHandlers(this);
         server.start();
+        clientExecutor = new ThreadPoolExecutor(
+                CORE_POLL_SIZE,
+                CORE_POLL_SIZE,
+                KEEP_ALIVE_TIME,
+                TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(QUEUE_CAPACITY)
+        );
+        this.client = HttpClient.newBuilder().executor(clientExecutor).build();
+        this.replicationManager = new ReplicationManager(
+                algorithm,
+                config.selfUrl(),
+                new RequestExecutor(dao),
+                new CircuitBreakerImpl(MAX_REQUEST_TRIES, config.clusterUrls()),
+                client
+        );
         return CompletableFuture.completedFuture(null);
     }
 
-    private Response getHandler(String id) {
-        Entry result = dao.get(stringToSegment(id));
-        if (result == null) {
-            return emptyResponse(Response.NOT_FOUND);
-        } else {
-            return new Response(Response.OK, result.value().toByteArray());
-        }
-    }
-
     @Path(PATH_ENTITY)
-    public Response entityHandler(@Param(PARAM_ID_NAME) String id, Request request) {
-        if (!checkId(id)) {
-            return new Response(Response.BAD_REQUEST, Utf8.toBytes(BAD_ID));
+    public void entityHandler(@Param(PARAM_ID_NAME) String id, Request request, HttpSession session,
+                              @Param(PARAM_ACK_NAME) String ackParam, @Param(PARAM_FROM_NAME) String fromParam) {
+        if (!Utils.checkId(id)) {
+            Utils.sendResponse(session, new Response(Response.BAD_REQUEST, Utf8.toBytes(Utils.BAD_ID)));
+            return;
         }
+        int ackNum;
+        int from;
+
+        if (fromParam == null || ackParam == null) {
+            from = algorithm.getShards().size();
+            ackNum = from / 2 + 1;
+        } else {
+            from = Integer.parseInt(fromParam);
+            ackNum = Integer.parseInt(ackParam);
+        }
+
+        if (validateAcks(ackParam, fromParam, ackNum, from)) {
+            Utils.sendResponse(session, Utils.emptyResponse(Response.BAD_REQUEST));
+            return;
+        }
+
         switch (request.getMethod()) {
-            case Request.METHOD_PUT:
-                return putHandler(request, id);
-            case Request.METHOD_GET:
-                return getHandler(id);
-            case Request.METHOD_DELETE:
-                return deleteHandler(id);
-            default:
-                return new Response(Response.METHOD_NOT_ALLOWED, Utf8.toBytes(NO_SUCH_METHOD));
-        }
-    }
-
-    private Response putHandler(Request request, String id) {
-        MemorySegment bodySegment = MemorySegment.ofArray(request.getBody());
-        dao.upsert(new Entry(stringToSegment(id), bodySegment));
-        return emptyResponse(Response.CREATED);
-    }
-
-    private void closeExecutorPool(ExecutorService pool) {
-        pool.shutdown();
-        try {
-            if (!pool.awaitTermination(1, TimeUnit.SECONDS)) {
-                pool.shutdownNow();
-                if (!pool.awaitTermination(1, TimeUnit.SECONDS)) {
-                    LOGGER.error("Pool didn't terminate");
-                }
+            case Request.METHOD_PUT, Request.METHOD_GET, Request.METHOD_DELETE -> {
+                replicationManager.handle(id, request, session, ackNum, from);
             }
-        } catch (InterruptedException ie) {
-            pool.shutdownNow();
-            Thread.currentThread().interrupt();
+            default -> {
+                LOGGER.error("Method is not allowed: " + request.getMethod());
+                Utils.sendResponse(session, new Response(Response.METHOD_NOT_ALLOWED,
+                        Utf8.toBytes(Utils.NO_SUCH_METHOD)));
+            }
         }
     }
 
-    private Response deleteHandler(String id) {
-        dao.upsert(new Entry(stringToSegment(id), null));
-        return emptyResponse(Response.ACCEPTED);
+    @Path(PATH_RANGE)
+    public void rangeHandler(@Param(PARAM_START) String start, @Param(PARAM_END) String end,
+                                                                Request request, HttpSession session) {
+        if (!Utils.checkId(start)) {
+            Utils.sendResponse(session, new Response(Response.BAD_REQUEST, Utf8.toBytes(Utils.BAD_ID)));
+            return;
+        }
+
+        if (request.getMethod() == Request.METHOD_GET) {
+            replicationManager.handleRange(start, end, session);
+        } else {
+            LOGGER.error("Method is not allowed for range request: " + request.getMethod());
+            Utils.sendResponse(session, new Response(Response.METHOD_NOT_ALLOWED,
+                    Utf8.toBytes(Utils.NO_SUCH_METHOD)));
+        }
+    }
+
+    private boolean validateAcks(String ackParam, String fromParam, int ackNum, int from) {
+        return ackNum <= 0 || from <= 0 || from > config.clusterUrls().size() || ackNum > from
+                || (ackParam != null && fromParam == null) || (ackParam == null && fromParam != null);
     }
 
     @Override
     public CompletableFuture<?> stop() throws IOException {
-        server.stop();
-        closeExecutorPool(requestService);
-        dao.close();
+        if (server != null) {
+            server.close();
+            server = null;
+        }
+        replicationManager = null;
+        Utils.closeExecutorPool(clientExecutor);
+        if (dao != null) {
+            dao.close();
+        }
         dao = null;
         return CompletableFuture.completedFuture(null);
     }
 
-    @ServiceFactory(stage = 2, week = 1, bonuses = "SingleNodeTest#respectFileFolder")
+    @ServiceFactory(stage = 6, week = 1, bonuses = "SingleNodeTest#respectFileFolder")
     public static class Factory implements ServiceFactory.Factory {
         @Override
         public Service create(ServiceConfig config) {
